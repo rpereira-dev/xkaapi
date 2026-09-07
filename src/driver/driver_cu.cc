@@ -1082,6 +1082,40 @@ XKRT_DRIVER_ENTRYPOINT(command_batch_init)(
                         }
 
                         CU_SAFE_CALL(cuGraphAddKernelNode(cu_node, handle->graph, deps, ndeps, &params));
+
+                        /* A program cgir fused from several device programs orders
+                         * its parts with a grid-wide barrier, which only completes
+                         * if every block is resident. In a stream that guarantee
+                         * comes from launching cooperatively; in a graph it comes
+                         * from the same attribute on the node
+                         * (CU_LAUNCH_ATTRIBUTE_COOPERATIVE is documented valid for
+                         * graph nodes as well as launches). Without it the node is
+                         * an ordinary launch, nothing holds the grid resident, and
+                         * the barrier hangs -- which is what packing a fused kernel
+                         * used to do.
+                         *
+                         * It also makes the driver validate the grid against what
+                         * the device can co-schedule, so a fused kernel that is too
+                         * large fails the launch instead of deadlocking. */
+                        if (command->prog.requires_coresident_grid)
+                        {
+                            /* Same restriction as the stream path: cgir builds fused
+                             * device kernels over individual parameters, never the
+                             * packed byte buffer, because the cooperative path has
+                             * no way to pass one. It cannot happen; check rather
+                             * than trust. */
+                            if (command->prog.prototype == cgir::CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_PACKED)
+                                LOGGER_FATAL("A fused device program uses the packed "
+                                             "argument ABI, which a cooperative graph "
+                                             "node cannot pass");
+
+                            CUlaunchAttributeValue coop;
+                            memset(&coop, 0, sizeof(coop));
+                            coop.cooperative = 1;
+                            CU_SAFE_CALL(
+                                cuGraphKernelNodeSetAttribute(
+                                    *cu_node, CU_LAUNCH_ATTRIBUTE_COOPERATIVE, &coop));
+                        }
                         break ;
                     }
 

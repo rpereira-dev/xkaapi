@@ -402,6 +402,16 @@ XKRT_DRIVER_ENTRYPOINT(prog_max_blocks_per_sm)(
     return (res == CUDA_SUCCESS && blocks > 0) ? (unsigned int) blocks : 0;
 }
 
+/* Number of SMs on the device (see driver_t::f_device_compute_units). Read once
+ * at device init into cu.prop.nsm. */
+static unsigned int
+XKRT_DRIVER_ENTRYPOINT(device_compute_units)(
+    device_driver_id_t device_driver_id
+) {
+    const device_cu_t * device = device_cu_get(device_driver_id);
+    return (device && device->cu.prop.nsm > 0) ? (unsigned int) device->cu.prop.nsm : 0;
+}
+
 # define USE_MMAP_EXPLICITLY 0
 
 # if USE_MMAP_EXPLICITLY
@@ -1319,21 +1329,63 @@ XKRT_DRIVER_ENTRYPOINT(command_launch_with_stream)(
                 (void *) CU_LAUNCH_PARAM_BUFFER_SIZE,    (void *) &command->prog.args_size,
                 (void *) CU_LAUNCH_PARAM_END
             };
-            CU_SAFE_CALL(
-                cuLaunchKernel(
-                    reinterpret_cast<CUfunction>(command->prog.launcher.variadic.fn),
-                    command->prog.grid.x,
-                    command->prog.grid.y,
-                    command->prog.grid.z,
-                    command->prog.block.x,
-                    command->prog.block.y,
-                    command->prog.block.z,
-                    command->prog.dyn_shmem,
-                    stream,
-                    packed ? nullptr : command->prog.args,   /* kernelParams */
-                    packed ? cu_config : nullptr             /* extra */
-                )
-            );
+            if (command->prog.requires_coresident_grid)
+            {
+                /* A program cgir fused from several device programs. It is one
+                 * launch where there used to be several, so the ordering the
+                 * launch boundaries used to provide now comes from a grid-wide
+                 * barrier inside the kernel -- and that barrier only completes if
+                 * every block is running at once. A cooperative launch is what
+                 * guarantees it: the driver either schedules the whole grid or
+                 * refuses, where an ordinary launch would simply hang.
+                 *
+                 * cgir checked the grid against max_coresident_blocks before
+                 * fusing, so a refusal here means that estimate was optimistic --
+                 * which is worth failing loudly over, and is exactly the outcome
+                 * this launch exists to turn into an error instead of a hang.
+                 *
+                 * cgir builds a fused device kernel over individual parameters
+                 * (the kernelParams ABI), never the packed byte buffer, and
+                 * cuLaunchCooperativeKernel has no `extra` argument to pass one
+                 * through -- so a packed fused device program would be silently
+                 * mislaunched. It cannot happen; check rather than trust. */
+                if (packed)
+                    LOGGER_FATAL("A fused device program uses the packed argument "
+                                 "ABI, which a cooperative launch cannot pass");
+
+                CU_SAFE_CALL(
+                    cuLaunchCooperativeKernel(
+                        reinterpret_cast<CUfunction>(command->prog.launcher.variadic.fn),
+                        command->prog.grid.x,
+                        command->prog.grid.y,
+                        command->prog.grid.z,
+                        command->prog.block.x,
+                        command->prog.block.y,
+                        command->prog.block.z,
+                        command->prog.dyn_shmem,
+                        stream,
+                        command->prog.args   /* kernelParams */
+                    )
+                );
+            }
+            else
+            {
+                CU_SAFE_CALL(
+                    cuLaunchKernel(
+                        reinterpret_cast<CUfunction>(command->prog.launcher.variadic.fn),
+                        command->prog.grid.x,
+                        command->prog.grid.y,
+                        command->prog.grid.z,
+                        command->prog.block.x,
+                        command->prog.block.y,
+                        command->prog.block.z,
+                        command->prog.dyn_shmem,
+                        stream,
+                        packed ? nullptr : command->prog.args,   /* kernelParams */
+                        packed ? cu_config : nullptr             /* extra */
+                    )
+                );
+            }
 
             return EINPROGRESS;
         }
@@ -1936,6 +1988,7 @@ XKRT_DRIVER_ENTRYPOINT(create_driver)(void)
     REGISTER(device_info);
     REGISTER(device_get_target);
     REGISTER(prog_max_blocks_per_sm);
+    REGISTER(device_compute_units);
 
     REGISTER(copy_h2d);
     REGISTER(copy_d2h);

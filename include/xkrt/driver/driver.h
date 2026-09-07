@@ -151,6 +151,15 @@ typedef struct  driver_t
      * management on this driver). */
     unsigned int (*f_prog_max_blocks_per_sm)(device_driver_id_t device_driver_id, void * fn, unsigned int block_threads, size_t dyn_smem);
 
+    /* Number of compute units (SMs) on the device, or 0 when unknown.
+     *
+     * With f_prog_max_blocks_per_sm this gives how many blocks of a program can
+     * run at the same time, which is what decides whether cgir may fuse several
+     * device programs into one kernel: a fused kernel orders its parts with a
+     * grid-wide barrier, and that barrier only completes if every block is
+     * resident. See command_prog_t::max_coresident_blocks. Optional. */
+    unsigned int (*f_device_compute_units)(device_driver_id_t device_driver_id);
+
     ////////////////////////////////
     //  MEMORY MANAGEMENT         //
     ////////////////////////////////

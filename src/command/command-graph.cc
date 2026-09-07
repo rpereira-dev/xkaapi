@@ -287,6 +287,22 @@ runtime_t::command_graph_from_task_dependency_graph(
                             (void *) rec.command.prog.launcher.variadic.fn,
                             rec.command.prog.block.x * rec.command.prog.block.y * rec.command.prog.block.z,
                             0);
+
+                        /* How many blocks of this program the device runs at
+                         * once. cgir needs it to decide whether it may fuse this
+                         * program with the next one: a fused kernel is a single
+                         * launch, so it orders its parts with a grid-wide barrier,
+                         * and a barrier only completes when every block is
+                         * resident (see command_prog_t::max_coresident_blocks).
+                         * Left at 0 when the driver cannot say, which makes cgir
+                         * decline to fuse -- the safe answer. */
+                        if (driver->f_device_compute_units)
+                        {
+                            const unsigned int nsm =
+                                driver->f_device_compute_units(cmd_device->driver_id);
+                            rec.command.prog.max_coresident_blocks =
+                                nsm * rec.command.prog.blocks_per_sm;
+                        }
                     }
                 }
             }

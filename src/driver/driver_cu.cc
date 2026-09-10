@@ -755,6 +755,45 @@ cu_occupancy(CUfunction fn, unsigned int threads, size_t dyn)
  * overwriting it is allowed. */
 static constexpr unsigned int CU_PROG_OCCUPANCY_APPLIED = ~0u;
 
+/* How far a rewritten program's occupancy may drift from the recorded one before
+ * the driver does anything about it, as a ratio in halves: 3/2, i.e. enforce only
+ * past a factor of 1.5 either way.
+ *
+ * A tolerance is not a concession, it is what makes the guard correct. Every lever
+ * the driver has is coarse -- the carveout is rounded to the device's own buckets,
+ * a register cap moves residency in whole blocks -- so demanding an exact match
+ * routinely means overshooting it. Measured on Krylov CG: a reduction kernel came
+ * out at 12 blocks/SM against 10 recorded, and the nearest carveout that satisfied
+ * "at most 10" gave 6. Cutting residency 40% to correct a 20% drift cost 35% of
+ * that kernel's runtime -- the guard did more damage than the drift it existed to
+ * prevent.
+ *
+ * The ratio is chosen against the regression that motivated the guard, which was
+ * roughly 7 -> 16 blocks/SM (2.3x) and still lands well outside it. It can afford
+ * to be generous because the driver is no longer the primary mechanism: cgir now
+ * declares the target to the assembler (`.minnctapersm`, see
+ * command_prog_t::blocks_per_sm), so the code arrives already sized for it and the
+ * driver only has to catch what codegen could not. */
+static constexpr unsigned int CU_PROG_OCCUPANCY_TOLERANCE_NUM = 3;
+static constexpr unsigned int CU_PROG_OCCUPANCY_TOLERANCE_DEN = 2;
+
+/* Whether `now` is far enough above / below `target` to be worth acting on.
+ * Written as products so the comparison stays in integers and never divides by a
+ * zero target (callers guarantee target > 0, but the form is robust anyway). */
+static inline bool
+cu_prog_occupancy_far_above(unsigned int now, unsigned int target)
+{
+    return (uint64_t) now * CU_PROG_OCCUPANCY_TOLERANCE_DEN >
+           (uint64_t) target * CU_PROG_OCCUPANCY_TOLERANCE_NUM;
+}
+
+static inline bool
+cu_prog_occupancy_far_below(unsigned int now, unsigned int target)
+{
+    return (uint64_t) now * CU_PROG_OCCUPANCY_TOLERANCE_NUM <
+           (uint64_t) target * CU_PROG_OCCUPANCY_TOLERANCE_DEN;
+}
+
 /* Bring a rewritten program's occupancy back down to `target`.
  *
  * Rewriting a program's code changes the per-block resources it uses, and those
@@ -789,26 +828,52 @@ cu_prog_lower_occupancy(CUfunction fn, unsigned int threads, unsigned int target
 {
     const int now = cu_occupancy(fn, threads, required);
 
+    /* The carveout this function was handed. Both scans below move it, so every
+     * path that decides against intervening has to put it back: the L1/shared
+     * split is an observable launch property, and silently changing it on a
+     * program we chose not to touch is precisely the class of accident this guard
+     * exists to prevent. CU_SHAREDMEM_CARVEOUT_DEFAULT (-1) is the "no preference"
+     * value and a legal thing to set back. */
+    int entry_pct = -1;
+    if (cuFuncGetAttribute(&entry_pct, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+                           fn) != CUDA_SUCCESS)
+        entry_pct = -1;
+
     /* 1. Carveout. Residency is monotone non-decreasing in the carveout, so scan
      * upwards and keep the setting with the highest residency that still respects
      * the target; among equal residencies the smallest carveout wins, since it
      * leaves the most L1. The percentage is a hint the driver rounds to its own
-     * buckets, hence a coarse scan rather than a binary search. */
-    int best_pct = -1, best_blocks = 0;
+     * buckets, hence a coarse scan rather than a binary search.
+     *
+     * Those buckets are why "still respects the target" is not enough on its own:
+     * the reachable residencies can step straight over it (10 wanted, 6 and 14
+     * offered), and taking the one below trades a small excess for a large
+     * deficit -- measured at 35% of a reduction kernel's runtime. A candidate that
+     * undershoots by more than the tolerance is therefore refused, and the scan
+     * also notes the cheapest carveout that stays *above* the target, which is the
+     * right base for the finer lever below. */
+    int best_pct = -1, best_blocks = 0;   /* closest at or below target */
+    int base_pct = -1;                    /* cheapest still above it */
     for (int pct = 0 ; pct <= 100 ; pct += 5)
     {
         if (cuFuncSetAttribute(fn, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, pct) != CUDA_SUCCESS)
             break ;
         const int blocks = cu_occupancy(fn, threads, required);
-        if (blocks == 0 || (unsigned int) blocks > target)
+        if (blocks == 0)
             continue ;
+        if ((unsigned int) blocks > target)
+        {
+            if (base_pct < 0)
+                base_pct = pct;
+            continue ;
+        }
         if (blocks > best_blocks)
         {
             best_blocks = blocks;
             best_pct    = pct;
         }
     }
-    if (best_pct >= 0)
+    if (best_pct >= 0 && !cu_prog_occupancy_far_below((unsigned int) best_blocks, target))
     {
         cuFuncSetAttribute(fn, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, best_pct);
         LOGGER_INFO("prog `%s`: rewritten code is %d blocks/SM vs %u recorded; "
@@ -818,32 +883,56 @@ cu_prog_lower_occupancy(CUfunction fn, unsigned int threads, unsigned int target
     }
 
     /* 2. Ballast. Residency is monotone non-increasing in the dynamic shared
-     * memory, so binary-search the smallest amount that meets the target, i.e.
-     * the least L1 given up. Stay under the 48KiB that needs no opt-in. */
-    cuFuncSetAttribute(fn, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, 0);
-    size_t lo = (size_t) required + 1, hi = 48u * 1024u, found = 0;
-    if (lo > hi || cu_occupancy(fn, threads, hi) > (int) target)
+     * memory, so binary-search the smallest amount that meets the target, i.e. the
+     * least L1 given up. Stay under the 48KiB that needs no opt-in.
+     *
+     * Start from the cheapest carveout that still leaves headroom above the
+     * target. Starting from one already below it would bake in the very undershoot
+     * step 1 just refused, and the byte-granular search would then dutifully add
+     * nothing while residency sat far too low. When no carveout leaves headroom,
+     * no combination of the two levers can land near the target and the honest
+     * answer is to leave the program alone. */
+    if (base_pct < 0)
     {
+        cuFuncSetAttribute(fn, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, entry_pct);
+        LOGGER_WARN("prog `%s`: rewritten code is %d blocks/SM vs %u recorded and no "
+                    "per-block resource brings it near it; launching as-is",
+                    name, now, target);
+        return required;
+    }
+    cuFuncSetAttribute(fn, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, base_pct);
+
+    /* Three outcomes per probe, not two: past the shared-memory capacity the
+     * occupancy query reports 0 blocks, which means `mid` is too much and the
+     * search has to go *down*. Reading that as "not enough ballast yet" and going
+     * up -- as this did -- walks the search into configurations that fit even
+     * less, ends with nothing found, and then reports success. */
+    size_t lo = (size_t) required + 1, hi = 48u * 1024u, found = 0;
+    while (lo <= hi)
+    {
+        const size_t mid = lo + (hi - lo) / 2;   /* >= lo >= 1, so mid - 1 is safe */
+        const int blocks = cu_occupancy(fn, threads, mid);
+        if (blocks == 0)                            /* exceeds shared capacity */
+            hi = mid - 1;
+        else if ((unsigned int) blocks <= target)   /* enough; try less */
+        {
+            found = mid;
+            hi    = mid - 1;
+        }
+        else                                        /* not enough yet */
+            lo = mid + 1;
+    }
+    if (found == 0)
+    {
+        cuFuncSetAttribute(fn, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, entry_pct);
         LOGGER_WARN("prog `%s`: rewritten code is %d blocks/SM vs %u recorded and no "
                     "per-block resource brings it back; launching as-is",
                     name, now, target);
         return required;
     }
-    while (lo <= hi)
-    {
-        const size_t mid = lo + (hi - lo) / 2;
-        const int blocks = cu_occupancy(fn, threads, mid);
-        if (blocks != 0 && (unsigned int) blocks <= target)
-        {
-            found = mid;
-            hi    = mid - 1;
-        }
-        else
-            lo = mid + 1;
-    }
-    LOGGER_INFO("prog `%s`: rewritten code is %d blocks/SM vs %u recorded; "
-                "%zu bytes of shared-memory ballast bring it back to %d",
-                name, now, target, found, cu_occupancy(fn, threads, found));
+    LOGGER_INFO("prog `%s`: rewritten code is %d blocks/SM vs %u recorded; a %d%% "
+                "carveout plus %zu bytes of shared-memory ballast bring it back to %d",
+                name, now, target, base_pct, found, cu_occupancy(fn, threads, found));
     return (unsigned int) found;
 }
 
@@ -944,7 +1033,11 @@ cu_prog_raise_occupancy(device_driver_id_t device_driver_id, cgir::command_t * c
  * its recorded occupancy. Both are once-per-command; the second runs for
  * precompiled kernels too, where it is a no-op by construction (their occupancy
  * *is* the recorded one), which keeps one code path and lets
- * XKRT_PROG_BLOCKS_PER_SM override the target for any program. */
+ * XKRT_PROG_BLOCKS_PER_SM override the target for any program.
+ *
+ * "Hold it to" means within a tolerance, not exactly -- see
+ * CU_PROG_OCCUPANCY_TOLERANCE_NUM for why an exact reading of the contract makes
+ * the guard harmful. */
 static void
 cu_prog_prepare(device_driver_id_t device_driver_id, cgir::command_t * command)
 {
@@ -972,12 +1065,13 @@ cu_prog_prepare(device_driver_id_t device_driver_id, cgir::command_t * command)
     if (now == 0)
         return ;
 
-    if ((unsigned int) now > target)
-        prog.dyn_shmem = cu_prog_lower_occupancy(fn, threads, target, prog.dyn_shmem,
-            prog.source.content.llvmir.symbol ? prog.source.content.llvmir.symbol : "?");
-    else if ((unsigned int) now < target)
-        cu_prog_raise_occupancy(device_driver_id, command, threads, target, now,
-            prog.source.content.llvmir.symbol ? prog.source.content.llvmir.symbol : "?");
+    const char * name = prog.source.content.llvmir.symbol
+                      ? prog.source.content.llvmir.symbol : "?";
+
+    if (cu_prog_occupancy_far_above((unsigned int) now, target))
+        prog.dyn_shmem = cu_prog_lower_occupancy(fn, threads, target, prog.dyn_shmem, name);
+    else if (cu_prog_occupancy_far_below((unsigned int) now, target))
+        cu_prog_raise_occupancy(device_driver_id, command, threads, target, now, name);
 }
 
 command_batch_cu_handle_t * XKRT_DRIVER_ENTRYPOINT(command_batch_ensure)(
